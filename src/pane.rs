@@ -1802,6 +1802,12 @@ fn publish_reported_cwd(
 }
 
 impl PaneRuntime {
+    /// The pane this runtime owns. Runtime construction records the pane identity,
+    /// so per-terminal work can key on the pane without walking the workspace tree.
+    pub fn pane_id(&self) -> PaneId {
+        self.pane_id
+    }
+
     pub fn shutdown(mut self) {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();

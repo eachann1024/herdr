@@ -1476,3 +1476,186 @@ fn timeout_retires_stream_without_producer_ack() {
     assert!(!server.clients[&7].direct_graphics);
     assert!(server.clients[&7].pixel_mouse);
 }
+
+/// Herdr keeps one process-wide Kitty graphics switch; tests own it explicitly.
+struct KittyGraphicsEnabled(bool);
+
+impl KittyGraphicsEnabled {
+    fn set(enabled: bool) -> Self {
+        let previous = crate::kitty_graphics::is_enabled();
+        crate::kitty_graphics::set_enabled(enabled);
+        Self(previous)
+    }
+}
+
+impl Drop for KittyGraphicsEnabled {
+    fn drop(&mut self) {
+        crate::kitty_graphics::set_enabled(self.0);
+    }
+}
+
+const KITTY_TEST_IMAGE: &[u8] = b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\";
+
+fn direct_attach_test_client(
+    server: &mut HeadlessServer,
+    client_id: u64,
+    terminal_id: &str,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (writer, _control_rx, render_rx) = test_client_writer();
+    server.clients.insert(
+        client_id,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::TerminalAttach {
+                terminal_id: terminal_id.to_owned(),
+            },
+            (80, 24),
+            crate::kitty_graphics::HostCellSize {
+                width_px: 10,
+                height_px: 20,
+            },
+            client_id,
+            RenderEncoding::TerminalAnsi,
+            Some(writer),
+        ),
+    );
+    render_rx
+}
+
+fn write_direct_terminal(server: &HeadlessServer, terminal_id: &str, bytes: &[u8]) {
+    server
+        .runtime_for_terminal_id_string(terminal_id)
+        .expect("attached runtime")
+        .test_process_pty_bytes(bytes);
+}
+
+fn next_direct_terminal_frame(receiver: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    match read_server_message(receive_render(receiver, Duration::from_millis(100))) {
+        ServerMessage::Terminal(frame) => frame.bytes,
+        other => panic!("expected direct terminal frame, got {other:?}"),
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[test]
+fn direct_terminal_attach_places_kitty_graphics_inside_the_synchronized_frame() {
+    let _enabled = KittyGraphicsEnabled::set(true);
+    with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _pane_id| {
+        let client_rx = direct_attach_test_client(server, 1, &terminal_id_string);
+        write_direct_terminal(server, &terminal_id_string, b"text before image");
+        write_direct_terminal(server, &terminal_id_string, KITTY_TEST_IMAGE);
+
+        server.render_and_stream();
+        let frame = next_direct_terminal_frame(&client_rx);
+        let graphics_at = find_bytes(&frame, b"\x1b7\x1b_Ga=t,").expect("kitty upload");
+        let text_at = find_bytes(&frame, b"text before image").expect("frame text");
+        assert!(text_at < graphics_at, "graphics must follow the frame text");
+        // Placements move the cursor themselves, so the frame wraps them in a
+        // saved cursor and the graphics stay inside the synchronized update.
+        let sync_end = frame
+            .windows(b"\x1b[?2026l".len())
+            .rposition(|window| window == b"\x1b[?2026l")
+            .expect("synchronized output end");
+        assert!(graphics_at < sync_end);
+        assert!(frame[..sync_end].ends_with(b"\x1b8"), "cursor restored");
+        // The image lands on the cells that drew its placeholder.
+        assert!(
+            find_bytes(&frame, b"\x1b[1;18H\x1b_Ga=p,").is_some(),
+            "placement at image cell"
+        );
+    });
+}
+
+#[test]
+fn direct_terminal_attach_reuses_uploaded_pixels_and_clears_removed_images() {
+    let _enabled = KittyGraphicsEnabled::set(true);
+    with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _pane_id| {
+        let client_rx = direct_attach_test_client(server, 1, &terminal_id_string);
+        write_direct_terminal(server, &terminal_id_string, b"text before image");
+        write_direct_terminal(server, &terminal_id_string, KITTY_TEST_IMAGE);
+
+        server.render_and_stream();
+        let first = next_direct_terminal_frame(&client_rx);
+        assert!(find_bytes(&first, b"\x1b_Ga=t,").is_some());
+
+        // Text updates must not re-send image pixels.
+        write_direct_terminal(server, &terminal_id_string, b"\r\nsecond line");
+        server.render_and_stream();
+        let second = next_direct_terminal_frame(&client_rx);
+        assert!(!second.is_empty(), "text update produces a frame");
+        assert!(find_bytes(&second, b"\x1b_Ga=t,").is_none());
+
+        // A closed preview keeps the image resident in the terminal, so the host
+        // placement must be deleted even though the terminal itself is now empty.
+        write_direct_terminal(server, &terminal_id_string, b"\x1b_Ga=d,d=A\x1b\\");
+        server.render_and_stream();
+        let deleted = next_direct_terminal_frame(&client_rx);
+        assert!(find_bytes(&deleted, b"\x1b_Ga=d,d=i,").is_some());
+
+        write_direct_terminal(server, &terminal_id_string, b"\rtext only again");
+        server.render_and_stream();
+        let text_only = next_direct_terminal_frame(&client_rx);
+        assert!(!text_only.is_empty(), "text update produces a frame");
+        assert!(find_bytes(&text_only, b"\x1b_G").is_none());
+    });
+}
+
+#[test]
+fn direct_terminal_attach_reuploads_graphics_for_a_new_connection() {
+    let _enabled = KittyGraphicsEnabled::set(true);
+    with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _pane_id| {
+        let first_rx = direct_attach_test_client(server, 1, &terminal_id_string);
+        write_direct_terminal(server, &terminal_id_string, KITTY_TEST_IMAGE);
+        server.render_and_stream();
+        assert!(find_bytes(&next_direct_terminal_frame(&first_rx), b"\x1b_Ga=t,").is_some());
+
+        // A reconnected client has no host image cache, so pixels must be sent again.
+        server.remove_client_and_resize_if_needed(1);
+        let second_rx = direct_attach_test_client(server, 2, &terminal_id_string);
+        server.render_and_stream();
+        let replayed = next_direct_terminal_frame(&second_rx);
+        assert!(find_bytes(&replayed, b"\x1b_Ga=t,").is_some());
+        assert!(find_bytes(&replayed, b"\x1b_Ga=p,").is_some());
+    });
+}
+
+#[test]
+fn direct_terminal_attach_sends_no_graphics_when_kitty_graphics_is_disabled() {
+    with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _pane_id| {
+        let _enabled = KittyGraphicsEnabled::set(false);
+        let client_rx = direct_attach_test_client(server, 1, &terminal_id_string);
+        write_direct_terminal(server, &terminal_id_string, KITTY_TEST_IMAGE);
+
+        server.render_and_stream();
+        let frame = next_direct_terminal_frame(&client_rx);
+        assert!(find_bytes(&frame, b"\x1b_G").is_none());
+    });
+}
+
+#[test]
+fn direct_terminal_attach_uploads_the_image_again_after_a_full_render_lane() {
+    let _enabled = KittyGraphicsEnabled::set(true);
+    with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _pane_id| {
+        let client_rx = direct_attach_test_client(server, 1, &terminal_id_string);
+        write_direct_terminal(server, &terminal_id_string, KITTY_TEST_IMAGE);
+
+        // The render lane is full, so this frame never reaches the client.
+        fill_render_lane(server);
+        server.render_and_stream();
+        let queued = receive_render(&client_rx, Duration::from_millis(100));
+        assert!(find_bytes(&queued, b"\x1b_G").is_none());
+
+        // A dropped frame must not mark the host image cache as delivered.
+        server.render_and_stream();
+        let retried = next_direct_terminal_frame(&client_rx);
+        assert!(
+            find_bytes(&retried, b"\x1b_Ga=t,").is_some(),
+            "retry must upload the image pixels"
+        );
+        assert!(find_bytes(&retried, b"\x1b_Ga=p,").is_some());
+    });
+}

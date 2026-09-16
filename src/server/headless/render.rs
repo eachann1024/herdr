@@ -1,5 +1,13 @@
 use super::*;
 
+/// Direct-terminal kitty graphics prepared for one client, committed to the
+/// client's host cache only after its frame reaches the client.
+struct StagedTerminalGraphics {
+    bytes: Vec<u8>,
+    pending: bool,
+    cache: crate::kitty_graphics::HostGraphicsCache,
+}
+
 impl HeadlessServer {
     fn shell_focused_runtime(
         &self,
@@ -345,6 +353,46 @@ impl HeadlessServer {
             .map(|(_, pane)| &pane.attached_terminal_id)
     }
 
+    /// Kitty graphics bytes for one directly rendered terminal, encoded into the
+    /// caller's staged host cache. The caller commits that cache only after the
+    /// frame is sent, so a dropped frame uploads its images again on the retry.
+    fn direct_terminal_graphics(
+        &self,
+        client_id: u64,
+        terminal_id: &crate::terminal::TerminalId,
+        area: Rect,
+        cell_size: crate::kitty_graphics::HostCellSize,
+        staged: &mut crate::kitty_graphics::HostGraphicsCache,
+    ) -> crate::kitty_graphics::EncodedGraphics {
+        let empty = crate::kitty_graphics::EncodedGraphics {
+            bytes: Vec::new(),
+            incomplete: false,
+        };
+        if !cell_size.is_known() || !crate::kitty_graphics::is_enabled() {
+            return empty;
+        }
+        let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) else {
+            return empty;
+        };
+        // Cheap exit for terminals that never showed an image. When the terminal
+        // dropped its placements the cache may still owe the host a delete.
+        if !runtime.kitty_graphics_may_have_placements() && !staged.has_host_placements() {
+            return empty;
+        }
+        let full_redraw = self.clients.get(&client_id).is_some_and(|client| {
+            client
+                .render_state
+                .terminal_frame_is_full_redraw(area.width, area.height)
+        });
+        crate::kitty_graphics::direct_terminal_graphics(
+            runtime,
+            area,
+            cell_size,
+            full_redraw,
+            staged,
+        )
+    }
+
     fn any_shell_surface_contains_pane(&self, pane_id: crate::layout::PaneId) -> bool {
         self.clients.iter().any(|(&client_id, client)| {
             if !client.is_active_shell_client() || client.writer.is_none() {
@@ -406,6 +454,55 @@ impl HeadlessServer {
         }
 
         let mut broken_clients: Vec<u64> = Vec::new();
+        // Direct terminals reuse the client shell's host graphics encoder. The
+        // kitty bytes are prepared before the render pass so they stay ordered
+        // with the text frame they belong to, and their host cache is staged here
+        // so a frame that never reaches the client keeps nothing resident.
+        let mut direct_graphics: HashMap<u64, StagedTerminalGraphics> = HashMap::new();
+        for (client_id, (cols, rows), cell_size, _, mode) in &render_targets {
+            let terminal_id = match mode {
+                ClientConnectionMode::TerminalAttach { terminal_id }
+                | ClientConnectionMode::TerminalObserve { terminal_id } => terminal_id,
+                ClientConnectionMode::ClientShell | ClientConnectionMode::TerminalPending => {
+                    continue;
+                }
+            };
+            let Some(terminal_id) = self.terminal_id_by_string(terminal_id) else {
+                continue;
+            };
+            let Some(client) = self.clients.get(client_id) else {
+                continue;
+            };
+            if !cell_size.is_known()
+                || !crate::kitty_graphics::is_enabled()
+                || (!client.terminal_graphics.has_host_placements()
+                    && !self
+                        .app
+                        .terminal_runtimes
+                        .get(&terminal_id)
+                        .is_some_and(|runtime| runtime.kitty_graphics_may_have_placements()))
+            {
+                continue;
+            }
+            let mut staged = client.terminal_graphics.clone();
+            let encoded = self.direct_terminal_graphics(
+                *client_id,
+                &terminal_id,
+                Rect::new(0, 0, *cols, *rows),
+                *cell_size,
+                &mut staged,
+            );
+            if !encoded.bytes.is_empty() || encoded.incomplete {
+                direct_graphics.insert(
+                    *client_id,
+                    StagedTerminalGraphics {
+                        bytes: encoded.bytes,
+                        pending: encoded.incomplete,
+                        cache: staged,
+                    },
+                );
+            }
+        }
         for (client_id, (cols, rows), cell_size, _is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let shell_target = self.shell_target_for_client(client_id);
@@ -546,6 +643,15 @@ impl HeadlessServer {
                 }
             };
 
+            let mut frame = frame;
+            let mut direct_graphics_pending = false;
+            let mut staged_graphics_cache = None;
+            if let Some(staged) = direct_graphics.remove(&client_id) {
+                frame.graphics = staged.bytes;
+                direct_graphics_pending = staged.pending;
+                staged_graphics_cache = Some(staged.cache);
+            }
+
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
@@ -553,13 +659,15 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render.writer_missing");
                 continue;
             };
-            let has_graphics = surface_parts
-                .as_ref()
-                .is_some_and(|(_, _, _, graphics, _)| {
-                    !graphics.assets.is_empty()
-                        || !graphics.placements.is_empty()
-                        || !graphics.retained_assets.is_empty()
-                });
+            let frame_has_graphics = !frame.graphics.is_empty();
+            let has_graphics = frame_has_graphics
+                || surface_parts
+                    .as_ref()
+                    .is_some_and(|(_, _, _, graphics, _)| {
+                        !graphics.assets.is_empty()
+                            || !graphics.placements.is_empty()
+                            || !graphics.retained_assets.is_empty()
+                    });
             let mut next_shell_graphics_delivery = None;
             let prepared = if let Some((panes, splits, popup, graphics, delivery)) = surface_parts {
                 next_shell_graphics_delivery = Some(delivery);
@@ -589,7 +697,11 @@ impl HeadlessServer {
                 crate::protocol::MAX_FRAME_SIZE
             };
             let mut shell_assets_deferred = false;
-            let serialized = match Self::frame_server_message_with_max(prepared.message(), max) {
+            let serialized = match if frame_has_graphics {
+                prepared.frame_terminal_chunks()
+            } else {
+                Self::frame_server_message_with_max(prepared.message(), max)
+            } {
                 Ok(frame) => frame,
                 Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
                     warn!(
@@ -632,11 +744,16 @@ impl HeadlessServer {
                 .is_some_and(crate::kitty_graphics::surface::DeliveryCache::has_pending);
             match writer.render.try_send(serialized) {
                 Ok(()) => {
+                    // Only a frame the client received may keep its host images
+                    // resident; a dropped frame must re-upload on the retry.
+                    if let Some(cache) = staged_graphics_cache {
+                        client.terminal_graphics = cache;
+                    }
                     if let Some(delivery) = next_shell_graphics_delivery {
                         client.shell_graphics_delivery = delivery;
                     }
                     client.render_state.commit_sent_frame(prepared);
-                    if shell_graphics_pending || shell_assets_deferred {
+                    if shell_graphics_pending || shell_assets_deferred || direct_graphics_pending {
                         client.defer_full_render();
                     } else {
                         client.clear_deferred_render();

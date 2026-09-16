@@ -164,8 +164,10 @@ fn run_client_with_mode(
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let host_cursor = loaded_config.config.ui.host_cursor;
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
-    let kitty_graphics_enabled =
-        loaded_config.config.kitty_graphics_enabled() && client_rendered_shell;
+    // Direct terminal attach and observe clients render the server's virtual
+    // terminal, so they also receive host Kitty graphics; tracking the received
+    // image ids lets detach delete them from the host terminal.
+    let kitty_graphics_enabled = loaded_config.config.kitty_graphics_enabled();
     let pixel_geometry_enabled = kitty_graphics_enabled || attach_escape.is_some();
     let endpoint_keybindings = shell_config
         .as_ref()

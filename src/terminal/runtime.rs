@@ -17,6 +17,11 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    /// The pane this terminal runtime owns.
+    pub fn pane_id(&self) -> PaneId {
+        self.0.pane_id()
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }

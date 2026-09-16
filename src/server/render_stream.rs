@@ -104,6 +104,20 @@ impl ClientRenderState {
         }
     }
 
+    /// Whether the next frame for this client repaints every cell, so directly
+    /// rendered terminal graphics must replay their host placements.
+    pub(crate) fn terminal_frame_is_full_redraw(&self, width: u16, height: u16) -> bool {
+        match self {
+            Self::TerminalAnsi {
+                blit_encoder,
+                repaint_pending,
+                ..
+            } => *repaint_pending || blit_encoder.is_full_redraw(width, height),
+            // Semantic clients render pane surfaces, not direct terminal frames.
+            Self::Semantic { .. } => false,
+        }
+    }
+
     pub(crate) fn last_pane_surface(&self) -> Option<&PaneSurfaceFrame> {
         match self {
             Self::Semantic { last_surface, .. } => last_surface.as_deref(),
@@ -194,13 +208,13 @@ impl ClientRenderState {
                     repaint_pending,
                 },
                 PreparedRender::TerminalAnsi {
+                    message: ServerMessage::Terminal(terminal),
                     frame,
                     encoded: Some(encoded),
-                    ..
                 },
             ) => {
                 blit_encoder.commit(frame, encoded);
-                *seq += 1;
+                *seq = terminal.seq;
                 *repaint_pending = false;
             }
             _ => {}
@@ -213,10 +227,17 @@ fn insert_graphics_before_sync_end(encoded: &mut Vec<u8>, graphics: &[u8]) {
         return;
     }
 
+    // Placement commands position the cursor themselves, so save and restore the
+    // frame's cursor around them. This matches the client-side graphics writer.
+    let mut wrapped = Vec::with_capacity(graphics.len() + 4);
+    wrapped.extend_from_slice(b"\x1b7");
+    wrapped.extend_from_slice(graphics);
+    wrapped.extend_from_slice(b"\x1b8");
+
     if let Some(sync_end) = crate::protocol::render_ansi::final_sync_output_end(encoded) {
-        encoded.splice(sync_end..sync_end, graphics.iter().copied());
+        encoded.splice(sync_end..sync_end, wrapped);
     } else {
-        encoded.extend_from_slice(graphics);
+        encoded.extend_from_slice(&wrapped);
     }
 }
 
@@ -238,6 +259,37 @@ impl PreparedRender {
         match self {
             Self::Semantic { message, .. } | Self::TerminalAnsi { message, .. } => message,
         }
+    }
+
+    /// Queue all chunks atomically; older direct clients cap each message at 2 MiB.
+    pub(crate) fn frame_terminal_chunks(
+        &mut self,
+    ) -> Result<Vec<u8>, crate::protocol::FramingError> {
+        let Self::TerminalAnsi {
+            message: ServerMessage::Terminal(frame),
+            ..
+        } = self
+        else {
+            unreachable!("only terminal ANSI frames carry inline graphics");
+        };
+        // Leave room for the existing bincode header. Terminal bytes are a stream,
+        // so even a split APC payload is reassembled by the host terminal parser.
+        const CHUNK: usize = crate::protocol::MAX_FRAME_SIZE - 128;
+        let mut framed = Vec::new();
+        let mut next_seq = frame.seq;
+        for (index, bytes) in frame.bytes.chunks(CHUNK).enumerate() {
+            let chunk = TerminalFrame {
+                seq: next_seq,
+                width: frame.width,
+                height: frame.height,
+                full: frame.full && index == 0,
+                bytes: bytes.to_vec(),
+            };
+            crate::protocol::write_message(&mut framed, &ServerMessage::Terminal(chunk))?;
+            next_seq += 1;
+        }
+        frame.seq = next_seq.saturating_sub(1);
+        Ok(framed)
     }
 
     pub(crate) fn strip_pane_surface_assets(&mut self) -> bool {
@@ -425,6 +477,48 @@ pub(crate) fn render_terminal_virtual(
 mod tests {
     use super::*;
     use crate::protocol::ClientShellPopupSurface;
+
+    #[test]
+    fn terminal_graphics_chunks_fit_legacy_limit_and_preserve_stream() {
+        let mut state = ClientRenderState::new(RenderEncoding::TerminalAnsi);
+        let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+            &ratatui::buffer::Buffer::with_lines(["image"]),
+            None,
+            &[],
+        );
+        frame.graphics = vec![b'A'; crate::protocol::MAX_FRAME_SIZE * 2];
+        let mut prepared = state.prepare_frame(frame.clone()).unwrap();
+        let ServerMessage::Terminal(original) = prepared.message() else {
+            panic!()
+        };
+        let expected = original.bytes.clone();
+        let encoded = prepared.frame_terminal_chunks().unwrap();
+        let mut input = std::io::Cursor::new(encoded);
+        let mut restored = Vec::new();
+        let mut count = 0;
+        while input.position() < input.get_ref().len() as u64 {
+            let ServerMessage::Terminal(chunk) = crate::protocol::read_message::<_, ServerMessage>(
+                &mut input,
+                crate::protocol::MAX_FRAME_SIZE,
+            )
+            .unwrap() else {
+                panic!()
+            };
+            count += 1;
+            assert_eq!(chunk.seq, count);
+            assert_eq!(chunk.full, count == 1);
+            restored.extend_from_slice(&chunk.bytes);
+        }
+        assert_eq!(restored, expected);
+        assert!(count > 1);
+        state.commit_sent_frame(prepared);
+        frame.graphics.clear();
+        let next = state.prepare_frame(frame).unwrap();
+        let ServerMessage::Terminal(next) = next.message() else {
+            panic!()
+        };
+        assert_eq!(next.seq, count + 1);
+    }
 
     fn popup_surface(content: &str) -> PaneSurfaceFrame {
         let pane = ratatui::buffer::Buffer::with_lines(["pane"]);

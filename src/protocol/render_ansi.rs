@@ -137,6 +137,13 @@ impl BlitEncoder {
         self.last_frame.as_ref() == Some(frame)
     }
 
+    /// Whether encoding a frame of this size repaints every cell.
+    pub(crate) fn is_full_redraw(&self, width: u16, height: u16) -> bool {
+        self.last_frame
+            .as_ref()
+            .is_none_or(|frame| frame.width != width || frame.height != height)
+    }
+
     pub(crate) fn encode_patch(
         &self,
         rows: &[PaneSurfacePatchRow],

@@ -492,6 +492,71 @@ impl HostGraphicsCache {
         self.reset_incremental_progress();
         bytes
     }
+
+    /// Whether the host terminal still shows a placement this cache sent.
+    pub(crate) fn has_host_placements(&self) -> bool {
+        !self.placements.is_empty()
+    }
+}
+
+/// Kitty graphics bytes for one directly rendered terminal viewport.
+///
+/// A directly attached terminal has no pane grid, so the host area is the whole
+/// viewport the client renders. Only the given terminal is read. `incomplete`
+/// reports that the next render must continue with the placements that did not
+/// fit this frame.
+///
+/// Host image ids key on the pane the runtime owns, which the runtime records at
+/// construction, so no workspace lookup is needed per frame.
+pub(crate) fn direct_terminal_graphics(
+    runtime: &crate::terminal::TerminalRuntime,
+    area: Rect,
+    cell_size: HostCellSize,
+    replay_placements: bool,
+    cache: &mut HostGraphicsCache,
+) -> EncodedGraphics {
+    let pane_id = runtime.pane_id();
+    let mut requested_images = HashSet::new();
+    let scrollback_offset = runtime
+        .scroll_metrics()
+        .map(|metrics| metrics.offset_from_bottom as u32)
+        .unwrap_or(0);
+    let placements = runtime
+        .kitty_image_placements_with_data_filter(|descriptor| {
+            terminal_image_needs_data(
+                pane_id,
+                descriptor,
+                &cache.images,
+                &cache.oversized,
+                &mut requested_images,
+            )
+        })
+        .into_iter()
+        .map(|placement| HostPlacement {
+            pane_id,
+            host_image_id: None,
+            area,
+            cell_size,
+            source_key: HostSourceKey::Terminal {
+                pane_id,
+                image_id: placement.image_id,
+            },
+            placement,
+            scrollback_offset,
+        })
+        .collect::<Vec<_>>();
+    if replay_placements {
+        // A full frame can have erased or reflowed host placements; re-emitting
+        // display commands for the images that are already uploaded restores them.
+        cache.request_placement_replay();
+    }
+    encode_graphics_update_incremental(
+        cache,
+        &placements,
+        &HashSet::new(),
+        Some(HEADLESS_GRAPHICS_TRANSACTION_BUDGET),
+        false,
+    )
 }
 
 fn collect_visible_placements(
