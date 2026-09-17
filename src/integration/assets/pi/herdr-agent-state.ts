@@ -184,6 +184,10 @@ export default function (pi) {
   let agentActive = false;
   let blockedCount = 0;
   let blockedMessage: string | undefined;
+  // Live async subagents outlive the parent turn. A settled agent that still
+  // owns runs is not idle; herdr reads unseen idle as done.
+  let busyCount = 0;
+  let busyPublishQueued = false;
   let lastState: AgentState | undefined;
   let lastMessage: string | undefined;
   let rootSession = false;
@@ -192,10 +196,24 @@ export default function (pi) {
     if (blockedCount > 0) {
       return { state: "blocked" as const, message: blockedMessage };
     }
-    if (agentActive) {
+    if (agentActive || busyCount > 0) {
       return { state: "working" as const, message: undefined };
     }
     return { state: "idle" as const, message: undefined };
+  }
+
+  function publishBusyState(): void {
+    // A run-label refresh lowers and raises this overlay in one turn. Publishing
+    // the intermediate zero would report idle and fire a done notification, so
+    // coalesce one turn of busy events and publish the net state once.
+    if (busyPublishQueued) {
+      return;
+    }
+    busyPublishQueued = true;
+    queueMicrotask(() => {
+      busyPublishQueued = false;
+      publishState();
+    });
   }
 
   function publishState(force = false) {
@@ -224,6 +242,16 @@ export default function (pi) {
     blockedCount += 1;
     blockedMessage = data.label;
     publishState();
+  });
+
+  // Counted sibling overlay owned by pi-subagents: raised while any
+  // current-session async run is live, lowered when the last one settles.
+  pi.events.on("herdr:busy", (data) => {
+    if (!rootSession || typeof data?.active !== "boolean") {
+      return;
+    }
+    busyCount = data.active ? busyCount + 1 : Math.max(0, busyCount - 1);
+    publishBusyState();
   });
 
   pi.on("session_start", async (event, ctx) => {
